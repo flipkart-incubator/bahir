@@ -18,11 +18,9 @@
 package org.apache.spark.streaming.pubsub
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
-import java.lang
-import java.lang.Runtime
-import java.util.concurrent.{Executors, TimeUnit}
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport
@@ -33,7 +31,7 @@ import com.google.api.services.pubsub.model.{AcknowledgeRequest, PubsubMessage, 
 import com.google.cloud.hadoop.util.RetryHttpInitializer
 import com.google.common.util.concurrent.RateLimiter
 
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkConf, SparkException}
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.streaming.dstream.ReceiverInputDStream
@@ -236,6 +234,9 @@ object ConnectionUtils {
  * See Spark streaming configurations doc
  * <a href="https://spark.apache.org/docs/latest/configuration.html#spark-streaming</a>
  *
+ * NOTE: For given subscription assuming ackDeadlineSeconds is sufficient.
+ * So that messages will not expire if it is buffer for given blockIntervalMs
+ *
  * @param project                   Google cloud project id
  * @param topic                     Topic name for creating subscription if need
  * @param subscription              Pub/Sub subscription name
@@ -267,6 +268,11 @@ class PubsubReceiver(
 
   val blockSize: Int = conf.getInt("spark.streaming.blockQueueSize", maxNoOfMessageInRequest)
 
+  val blockIntervalMs: Long = conf.getTimeAsMs("spark.streaming.blockInterval", "200ms")
+
+  var buffer: ArrayBuffer[ReceivedMessage] = createBufferArray()
+
+  var latestStorePushTime: Long = -1
 
   lazy val rateLimiter: RateLimiter = RateLimiter.create(getInitialRateLimit.toDouble)
 
@@ -285,6 +291,7 @@ class PubsubReceiver(
       case Some(t) =>
         val sub: Subscription = new Subscription
         sub.setTopic(s"$projectFullName/topics/$t")
+        sub.setAckDeadlineSeconds(30)
         try {
           client.projects().subscriptions().create(subscriptionFullName, sub).execute()
         } catch {
@@ -311,8 +318,10 @@ class PubsubReceiver(
     val pullRequest = new PullRequest()
       .setMaxMessages(maxNoOfMessageInRequest).setReturnImmediately(false)
     var backoff = INIT_BACKOFF
+
     while (!isStopped()) {
       try {
+
         val pullResponse =
           client.projects().subscriptions().pull(subscriptionFullName, pullRequest).execute()
         val receivedMessages = pullResponse.getReceivedMessages
@@ -320,9 +329,14 @@ class PubsubReceiver(
         // update rate limit if required
         updateRateLimit()
 
+        // Put data into buffer
         if (receivedMessages != null) {
-          pushToStoreAndAck(receivedMessages.asScala.toList)
+          buffer.appendAll(receivedMessages.asScala)
         }
+
+        // Push data from buffer to store
+        push()
+
         backoff = INIT_BACKOFF
       } catch {
         case e: GoogleJsonResponseException =>
@@ -356,22 +370,63 @@ class PubsubReceiver(
   }
 
   /**
+   * Push data into store if
+   *  1. buffer size greater than equal to blockSize, or
+   *  2. blockInterval time is passed and buffer size is less than blockSize
+   *
+   *  Before pushing the messages, first create iterator of complete block(s) and partial blocks
+   *  and assigning new array to buffer.
+   *
+   *  So during pushing data into store if any {@link org.apache.spark.SparkException} occur
+   *  then all un-push messages or un-ack will be lost.
+   *
+   *  To recover lost messages we are relying on pubsub
+   *  (i.e after ack deadline passed then pubsub will again give that messages)
+   */
+  def push(): Unit = {
+
+    val diff = System.currentTimeMillis() - latestStorePushTime
+    if (buffer.length >= blockSize ||
+      (latestStorePushTime != -1 && buffer.length < blockSize && diff >= blockIntervalMs)) {
+
+      // grouping messages into complete and partial blocks (if any)
+      val (completeBlocks, partialBlock) = buffer.grouped(blockSize)
+        .partition(block => block.length == blockSize)
+
+      // If completeBlocks is empty it means within block interval time
+      // messages in buffer is less than blockSize. So will push partial block
+      val iterator = if (completeBlocks.nonEmpty) completeBlocks else partialBlock
+
+      // Creating new buffer
+      buffer = createBufferArray()
+
+      // Pushing partial block messages back to buffer if complete blocks formed
+      if (completeBlocks.nonEmpty) {
+        buffer.appendAll(partialBlock.next())
+      }
+
+      while (iterator.hasNext) {
+        pushToStoreAndAck(iterator.next().toList)
+        latestStorePushTime = System.currentTimeMillis()
+      }
+    }
+  }
+
+  /**
    * Push the list of received message into store and ack messages if auto ack is true
    * @param receivedMessages
    */
   def pushToStoreAndAck(receivedMessages: List[ReceivedMessage]): Unit = {
-    receivedMessages
+    val messages = receivedMessages
       .map(x => {
         val sm = new SparkPubsubMessage
         sm.message = x.getMessage
         sm.ackId = x.getAckId
         sm})
-      .grouped(blockSize)
-      .foreach(messages => {
-        rateLimiter.acquire(messages.size)
-        store(messages.toIterator)
-        if (autoAcknowledge) acknowledgeIds(messages.map(_.ackId))
-      })
+
+    rateLimiter.acquire(messages.size)
+    store(messages.toIterator)
+    if (autoAcknowledge) acknowledgeIds(messages.map(_.ackId))
   }
 
   /**
@@ -383,6 +438,10 @@ class PubsubReceiver(
     ackRequest.setAckIds(ackIds.asJava)
     client.projects().subscriptions()
       .acknowledge(subscriptionFullName, ackRequest).execute()
+  }
+
+  private def createBufferArray(): ArrayBuffer[ReceivedMessage] = {
+    new ArrayBuffer[ReceivedMessage](2 * math.max(maxNoOfMessageInRequest, blockSize))
   }
 
   override def onStop(): Unit = {}
