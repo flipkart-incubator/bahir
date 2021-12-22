@@ -55,13 +55,14 @@ class PubsubInputDStream(
     val _storageLevel: StorageLevel,
     val autoAcknowledge: Boolean,
     val maxNoOfMessageInRequest: Int,
+    val rateMultiplierFactor: Double,
     conf: SparkConf
 ) extends ReceiverInputDStream[SparkPubsubMessage](_ssc) {
 
   override def getReceiver(): Receiver[SparkPubsubMessage] = {
     new PubsubReceiver(
       project, topic, subscription, credential, _storageLevel, autoAcknowledge,
-      maxNoOfMessageInRequest, conf
+      maxNoOfMessageInRequest, rateMultiplierFactor, conf
     )
   }
 }
@@ -244,6 +245,9 @@ object ConnectionUtils {
  * @param storageLevel              Storage level to be used
  * @param autoAcknowledge           Acknowledge pubsub message or not
  * @param maxNoOfMessageInRequest   Maximum number of message in a Pubsub pull request
+ * @param rateMultiplierFactor      Increase the proposed rate estimated by PIDEstimator to take the
+ *                                  advantage of dynamic allocation of executor.
+ *                                  Default should be 1 if dynamic allocation is not enabled
  * @param conf                      Spark config
  */
 private[pubsub]
@@ -255,6 +259,7 @@ class PubsubReceiver(
     storageLevel: StorageLevel,
     autoAcknowledge: Boolean,
     maxNoOfMessageInRequest: Int,
+    rateMultiplierFactor: Double,
     conf: SparkConf)
     extends Receiver[SparkPubsubMessage](storageLevel) {
 
@@ -363,7 +368,7 @@ class PubsubReceiver(
    * and update the rate limiter with new rate
    */
   def updateRateLimit(): Unit = {
-    val newRateLimit = supervisor.getCurrentRateLimit.min(maxRateLimit)
+    val newRateLimit = rateMultiplierFactor * supervisor.getCurrentRateLimit.min(maxRateLimit)
     if (rateLimiter.getRate != newRateLimit) {
       rateLimiter.setRate(newRateLimit)
     }
