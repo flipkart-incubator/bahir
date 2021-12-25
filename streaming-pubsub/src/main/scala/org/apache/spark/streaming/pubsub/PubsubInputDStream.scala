@@ -324,6 +324,9 @@ class PubsubReceiver(
       .setMaxMessages(maxNoOfMessageInRequest).setReturnImmediately(false)
     var backoff = INIT_BACKOFF
 
+    // To avoid the edge case when buffer is not full and no message pushed to store
+    latestStorePushTime = System.currentTimeMillis()
+
     while (!isStopped()) {
       try {
 
@@ -391,8 +394,7 @@ class PubsubReceiver(
   def push(): Unit = {
 
     val diff = System.currentTimeMillis() - latestStorePushTime
-    if (buffer.length >= blockSize ||
-      (latestStorePushTime != -1 && buffer.length < blockSize && diff >= blockIntervalMs)) {
+    if (buffer.length >= blockSize || (buffer.length < blockSize && diff >= blockIntervalMs)) {
 
       // grouping messages into complete and partial blocks (if any)
       val (completeBlocks, partialBlock) = buffer.grouped(blockSize)
@@ -406,7 +408,7 @@ class PubsubReceiver(
       buffer = createBufferArray()
 
       // Pushing partial block messages back to buffer if complete blocks formed
-      if (completeBlocks.nonEmpty) {
+      if (completeBlocks.nonEmpty && partialBlock.hasNext) {
         buffer.appendAll(partialBlock.next())
       }
 
