@@ -277,7 +277,7 @@ class PubsubReceiver(
 
   var buffer: ArrayBuffer[ReceivedMessage] = createBufferArray()
 
-  var latestStorePushTime: Long = -1
+  var latestAttemptToPushInStoreTime: Long = -1
 
   lazy val rateLimiter: RateLimiter = RateLimiter.create(getInitialRateLimit.toDouble)
 
@@ -325,7 +325,7 @@ class PubsubReceiver(
     var backoff = INIT_BACKOFF
 
     // To avoid the edge case when buffer is not full and no message pushed to store
-    latestStorePushTime = System.currentTimeMillis()
+    latestAttemptToPushInStoreTime = System.currentTimeMillis()
 
     while (!isStopped()) {
       try {
@@ -393,7 +393,7 @@ class PubsubReceiver(
    */
   def push(): Unit = {
 
-    val diff = System.currentTimeMillis() - latestStorePushTime
+    val diff = System.currentTimeMillis() - latestAttemptToPushInStoreTime
     if (buffer.length >= blockSize || (buffer.length < blockSize && diff >= blockIntervalMs)) {
 
       // grouping messages into complete and partial blocks (if any)
@@ -404,18 +404,29 @@ class PubsubReceiver(
       // messages in buffer is less than blockSize. So will push partial block
       val iterator = if (completeBlocks.nonEmpty) completeBlocks else partialBlock
 
-      // Creating new buffer
-      buffer = createBufferArray()
-
-      // Pushing partial block messages back to buffer if complete blocks formed
-      if (completeBlocks.nonEmpty && partialBlock.hasNext) {
-        buffer.appendAll(partialBlock.next())
-      }
+      // Will push partial block messages back to buffer if complete blocks formed
+      val partial = if (completeBlocks.nonEmpty && partialBlock.nonEmpty) {
+        partialBlock.next()
+      } else null
 
       while (iterator.hasNext) {
-        pushToStoreAndAck(iterator.next().toList)
-        latestStorePushTime = System.currentTimeMillis()
+        try {
+          pushToStoreAndAck(iterator.next().toList)
+        } catch {
+          case e: SparkException => reportError(
+            "Failed to write messages into reliable store", e)
+          case NonFatal(e) => reportError(
+            "Failed to write messages in reliable store", e)
+        } finally {
+          latestAttemptToPushInStoreTime = System.currentTimeMillis()
+        }
       }
+
+      // clear existing buffer messages
+      buffer.clear()
+
+      // Pushing partial block messages back to buffer if complete blocks formed
+      if (partial != null) buffer.appendAll(partial)
     }
   }
 
