@@ -296,6 +296,8 @@ class PubsubReceiver(
   val projectFullName: String = s"projects/$project"
   val subscriptionFullName: String = s"$projectFullName/subscriptions/$subscription"
 
+  val RECEIVED_MESSAGE_SOURCE_TOPIC_KEY: String = "topic"
+
   override def onStart(): Unit = {
     topic match {
       case Some(t) =>
@@ -446,6 +448,16 @@ class PubsubReceiver(
         val sm = new SparkPubsubMessage
         sm.message = x.getMessage
         sm.ackId = x.getAckId
+        /* Add source topic info in message attribute. This can be used to get source of
+            message in case of stream from multiple pubsub topics in a single spark context
+         */
+         if (topic.isDefined) {
+           if (sm.message.getAttributes == null) {
+            sm.message.setAttributes(Map(RECEIVED_MESSAGE_SOURCE_TOPIC_KEY -> topic.get).asJava)
+          } else {
+            sm.message.getAttributes.put(RECEIVED_MESSAGE_SOURCE_TOPIC_KEY, topic.get)
+          }
+        }
         sm})
 
     rateLimiter.acquire(messages.size)

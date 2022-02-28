@@ -165,7 +165,11 @@ class PubsubStreamSuite extends ConditionalSparkFunSuite with Eventually with Be
         sendMessages.map(m => new String(m.getData()))
           .contains(new String(receiveMessages.head.getData()))
       )
-      assert(sendMessages.map(_.getAttributes()).contains(receiveMessages.head.getAttributes()))
+      if (topicName.isEmpty) {
+        assert(sendMessages.map(_.getAttributes()).contains(receiveMessages.head.getAttributes()))
+      } else {
+        assert(receiveMessages.map(_.getAttributes()).exists(_.containsKey("topic")))
+      }
       assert(receiveMessages.head.getAckId() != null)
     }
   }
